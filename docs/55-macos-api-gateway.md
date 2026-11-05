@@ -11,7 +11,10 @@ API transport listener uses a private 127.0.0.1 port. TLS, authentication and AP
 proxy settings come from the existing kubeconfig.
 
 A shared UDP/TCP loopback DNS listener forwards cluster-domain questions through
-an API TCP channel to CoreDNS. Scoped macOS resolver files select this listener.
+an API TCP channel to CoreDNS. Each selected Service and Pod FQDN receives its own
+macOS resolver file. The longest matching domain selects this listener alongside
+existing kubevpn search-domain resolvers. Discovery reconciles these FQDN files
+and detects external edits to files owned by this session.
 Selected FQDN tokens pointing to old IPv4 loopback entries are temporarily removed
 from hosts. Cluster DNS supplies the real Service and Pod addresses.
 
@@ -36,7 +39,8 @@ port-forward access in those namespaces and the DNS namespace.
 ## Discovery and recovery
 
 Metadata refreshes every five seconds. Endpoint ports stay paired with their own
-Pod identities. UID changes replace affected listeners. DNS refresh checks both
+Pod identities. UID changes replace affected listeners. Added and removed FQDNs
+acquire and restore their own resolver files. DNS refresh checks both
 its backend identity and an actual query, then reconnects on the existing private
 port. Three consecutive metadata or DNS refresh failures withdraw the gateway
 and initiate recovery.

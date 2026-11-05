@@ -154,31 +154,53 @@ func (s *SystemState) Configure(domains []string, port int, hostnames []string) 
 	if port < 1 || port > 65535 {
 		return errors.New("invalid local DNS port")
 	}
+	desired := make(map[string]bool, len(domains))
 	for _, domain := range domains {
 		if !validDomain(domain) {
 			return fmt.Errorf("invalid resolver domain %q", domain)
 		}
+		desired[domain] = true
 	}
 	if err := os.MkdirAll(s.resolvers, 0755); err != nil {
 		return err
 	}
 	for _, domain := range domains {
 		path := filepath.Join(s.resolvers, domain)
-		entry, ok := s.journal.Resolvers[domain]
-		if !ok {
-			before, err := readImage(path)
-			if err != nil {
-				return err
-			}
-			entry.Before = before
+		current, err := readImage(path)
+		if err != nil {
+			return err
 		}
-		entry.Written = []byte(fmt.Sprintf("# kubevpn local API gateway\ndomain %s\nnameserver 127.0.0.1\nport %d\noptions timeout:1\n", domain, port))
+		entry, ok := s.journal.Resolvers[domain]
+		written := []byte(fmt.Sprintf("# kubevpn local API gateway\ndomain %s\nnameserver 127.0.0.1\nport %d\noptions timeout:1\n", domain, port))
+		if ok {
+			if !sameImage(current, resolverWrittenImage(entry)) {
+				return fmt.Errorf("resolver %s changed externally; left untouched", domain)
+			}
+			if bytes.Equal(entry.Written, written) {
+				continue
+			}
+		} else {
+			entry.Before = current
+		}
+		entry.Written = written
 		s.journal.Resolvers[domain] = entry
 		if err := s.save(); err != nil {
 			return err
 		}
 		image := resolverWrittenImage(entry)
 		if err := replaceImage(path, image); err != nil {
+			return err
+		}
+	}
+	for domain, entry := range s.journal.Resolvers {
+		if desired[domain] {
+			continue
+		}
+		if err := s.restoreResolver(domain, entry); err != nil {
+			return err
+		}
+		delete(s.journal.Resolvers, domain)
+		if err := s.save(); err != nil {
 			return err
 		}
 	}
@@ -223,21 +245,7 @@ func (s *SystemState) Restore() error {
 			errs = append(errs, fmt.Errorf("invalid journal domain %q", domain))
 			continue
 		}
-		entry := s.journal.Resolvers[domain]
-		path := filepath.Join(s.resolvers, domain)
-		current, err := readImage(path)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		if sameImage(current, entry.Before) {
-			continue
-		}
-		if !sameImage(current, resolverWrittenImage(entry)) {
-			errs = append(errs, fmt.Errorf("resolver %s changed externally; left untouched", domain))
-			continue
-		}
-		if err = replaceImage(path, entry.Before); err != nil {
+		if err := s.restoreResolver(domain, s.journal.Resolvers[domain]); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -259,6 +267,21 @@ func (s *SystemState) Restore() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func (s *SystemState) restoreResolver(domain string, entry resolverImage) error {
+	path := filepath.Join(s.resolvers, domain)
+	current, err := readImage(path)
+	if err != nil {
+		return err
+	}
+	if sameImage(current, entry.Before) {
+		return nil
+	}
+	if !sameImage(current, resolverWrittenImage(entry)) {
+		return fmt.Errorf("resolver %s changed externally; left untouched", domain)
+	}
+	return replaceImage(path, entry.Before)
 }
 
 func (s *SystemState) Finish() error { return os.Remove(filepath.Join(s.dir, "journal.json")) }

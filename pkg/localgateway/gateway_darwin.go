@@ -36,7 +36,6 @@ type activeBinding struct {
 type sessionEvent struct {
 	key     string
 	session *Session
-	err     error
 }
 
 func bindingKey(b Binding) string { return net.JoinHostPort(b.IP, strconv.Itoa(b.Port)) }
@@ -152,9 +151,9 @@ func RunGateway(parent context.Context, config *rest.Config, c GatewayConfig, ou
 	events := make(chan sessionEvent, 128)
 	watch := func(key string, s *Session) {
 		go func() {
-			err := s.Wait()
+			_ = s.Wait()
 			select {
-			case events <- sessionEvent{key: key, session: s, err: err}:
+			case events <- sessionEvent{key: key, session: s}:
 			case <-ctx.Done():
 			}
 		}()
@@ -222,6 +221,9 @@ func RunGateway(parent context.Context, config *rest.Config, c GatewayConfig, ou
 				return err
 			}
 		}
+		if err := restartClosedBindings(ctx, forwarder, plan.Bindings, running, watch, out); err != nil {
+			return err
+		}
 		for _, b := range plan.Bindings {
 			key := bindingKey(b)
 			if _, ok := running[key]; ok {
@@ -256,21 +258,9 @@ func RunGateway(parent context.Context, config *rest.Config, c GatewayConfig, ou
 			running[key] = activeBinding{binding: b, session: session}
 			watch(key, session)
 		}
-		return state.UpdateHosts(plan.Hostnames)
+		return state.Configure(plan.Hostnames, relay.Port, plan.Hostnames)
 	}
 	if err = reconcile(plan); err != nil {
-		return err
-	}
-	domains := []string{c.ClusterDomain, "svc." + c.ClusterDomain}
-	namespaces := map[string]bool{}
-	for _, ref := range c.Services {
-		namespaces[ref.Namespace] = true
-	}
-	for ns := range namespaces {
-		domains = append(domains, ns+".svc."+c.ClusterDomain)
-	}
-	sort.Strings(domains)
-	if err = state.Configure(domains, relay.Port, plan.Hostnames); err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "READY: %d TCP mappings, DNS 127.0.0.1:%d, recovery state %s\n", len(running), relay.Port, c.StateDir)
@@ -318,15 +308,6 @@ func RunGateway(parent context.Context, config *rest.Config, c GatewayConfig, ou
 			if !ok || item.session != event.session {
 				continue
 			}
-			delete(running, event.key)
-			_ = item.session.Close()
-			if err := aliases.Release(ctx, item.binding.IP); err != nil {
-				return err
-			}
-			if err := syncAliases(); err != nil {
-				return err
-			}
-			fmt.Fprintf(out, "Reconnecting %s after API transport closed: %v\n", event.key, event.err)
 			if err := refresh(); err != nil {
 				return err
 			}
@@ -336,6 +317,31 @@ func RunGateway(parent context.Context, config *rest.Config, c GatewayConfig, ou
 			}
 		}
 	}
+}
+
+// Rebuild every ended session from one topology snapshot without releasing the
+// alias lease of a binding that is still desired. Queued old events become stale.
+func restartClosedBindings(ctx context.Context, forwarder *Forwarder, desired []Binding, running map[string]activeBinding, watch func(string, *Session), out io.Writer) error {
+	for _, binding := range desired {
+		key := bindingKey(binding)
+		item, ok := running[key]
+		if !ok || item.binding != binding {
+			continue
+		}
+		select {
+		case <-item.session.done:
+		default:
+			continue
+		}
+		fmt.Fprintf(out, "Reconnecting %s after API transport closed: %v\n", key, item.session.Wait())
+		session, err := forwarder.Start(ctx, binding)
+		if err != nil {
+			return fmt.Errorf("restart %s -> %s/%s:%d: %w", key, binding.Namespace, binding.Pod, binding.PodPort, err)
+		}
+		running[key] = activeBinding{binding: binding, session: session}
+		watch(key, session)
+	}
+	return nil
 }
 
 func findDNSBinding(ctx context.Context, client kubernetes.Interface, c GatewayConfig) (Binding, error) {

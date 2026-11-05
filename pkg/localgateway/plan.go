@@ -22,8 +22,8 @@ type ServiceRef struct {
 	Name      string
 }
 
-// Plan contains a complete, validated snapshot. Hostnames are only used to
-// remove obsolete loopback hosts entries; DNS remains authoritative.
+// Plan contains a complete, validated snapshot. Hostnames scope native resolvers
+// and remove obsolete loopback hosts entries; cluster DNS remains authoritative.
 type Plan struct {
 	Bindings  []Binding
 	Hostnames []string

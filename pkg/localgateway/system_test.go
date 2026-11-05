@@ -527,3 +527,218 @@ func TestSystemStateRejectsNonPrivateAndSymlinkDirectories(t *testing.T) {
 		t.Fatal("accepted a nonregular lock file")
 	}
 }
+
+func TestSystemFQDNResolversSurviveLegacySuffixRefresh(t *testing.T) {
+	const first = "api.dev.svc.cluster.local"
+	const second = "redis-0.redis-headless.dev.svc.cluster.local"
+	originalHosts := []byte("127.0.0.1 localhost\n127.1.27.1 api " + first + "\n127.1.27.2 " + second + "\n")
+	paths := newSystemTestPaths(t, originalHosts)
+	suffixes := []string{"cluster.local", "svc.cluster.local", "dev.svc.cluster.local"}
+	for _, suffix := range suffixes {
+		writeSystemTestFile(t, filepath.Join(paths.resolvers, suffix), []byte("nameserver 192.0.2.53\nport 53\n"), 0644)
+	}
+	state := paths.open(t, false)
+	selected := []string{first, second}
+	if err := state.Configure(selected, 53053, selected); err != nil {
+		t.Fatal(err)
+	}
+	written := map[string][]byte{}
+	for _, domain := range selected {
+		data, _ := readSystemTestFile(t, filepath.Join(paths.resolvers, domain))
+		for _, field := range []string{"domain " + domain + "\n", "nameserver 127.0.0.1\n", "port 53053\n"} {
+			if !bytes.Contains(data, []byte(field)) {
+				t.Fatalf("full resolver %s missing %q: %s", domain, field, data)
+			}
+		}
+		written[domain] = data
+	}
+	before := readSystemTestJournal(t, paths)
+	if len(before.Resolvers) != 2 {
+		t.Fatalf("unexpected resolver ownership: %+v", before.Resolvers)
+	}
+	// A legacy kubevpn refresh owns broad suffix files. It must not affect the
+	// gateway's longer full-name files or cause the gateway to claim the suffix.
+	external := []byte("# refreshed by legacy resolver manager\nnameserver 198.51.100.53\nport 53\n")
+	for _, suffix := range suffixes {
+		writeSystemTestFile(t, filepath.Join(paths.resolvers, suffix), external, 0640)
+	}
+	if err := state.Configure(selected, 53053, selected); err != nil {
+		t.Fatal(err)
+	}
+	for _, domain := range selected {
+		data, _ := readSystemTestFile(t, filepath.Join(paths.resolvers, domain))
+		if !bytes.Equal(data, written[domain]) {
+			t.Fatalf("legacy suffix refresh changed full resolver %s: %s", domain, data)
+		}
+	}
+	for _, suffix := range suffixes {
+		data, mode := readSystemTestFile(t, filepath.Join(paths.resolvers, suffix))
+		if !bytes.Equal(data, external) || mode != 0640 {
+			t.Fatalf("gateway rewrote legacy suffix %s: mode=%o data=%q", suffix, mode, data)
+		}
+	}
+	after := readSystemTestJournal(t, paths)
+	if !reflect.DeepEqual(after.Resolvers, before.Resolvers) || len(after.Removed) != len(before.Removed) {
+		t.Fatalf("unchanged refresh changed recovery authority: before=%+v after=%+v", before, after)
+	}
+	if err := state.Restore(); err != nil {
+		t.Fatal(err)
+	}
+	for _, domain := range selected {
+		if _, err := os.Lstat(filepath.Join(paths.resolvers, domain)); !os.IsNotExist(err) {
+			t.Fatalf("full resolver retained on restore: %s: %v", domain, err)
+		}
+	}
+	for _, suffix := range suffixes {
+		data, _ := readSystemTestFile(t, filepath.Join(paths.resolvers, suffix))
+		if !bytes.Equal(data, external) {
+			t.Fatalf("restore touched unowned legacy suffix %s", suffix)
+		}
+	}
+	hosts, _ := readSystemTestFile(t, paths.hosts)
+	if !bytes.Equal(hosts, originalHosts) {
+		t.Fatalf("hosts not restored: %q", hosts)
+	}
+}
+
+func TestSystemConfigureRefreshRejectsExternalOwnedResolverChanges(t *testing.T) {
+	for _, change := range []string{"contents", "permissions", "removed"} {
+		t.Run(change, func(t *testing.T) {
+			const domain = "api.dev.svc.cluster.local"
+			paths := newSystemTestPaths(t, []byte("127.1.27.1 "+domain+"\n"))
+			path := filepath.Join(paths.resolvers, domain)
+			before := []byte("# preexisting full-name resolver\nnameserver 192.0.2.53\nport 53\n")
+			writeSystemTestFile(t, path, before, 0640)
+			state := paths.open(t, false)
+			if err := state.Configure([]string{domain}, 53053, []string{domain}); err != nil {
+				t.Fatal(err)
+			}
+			journal := readSystemTestJournal(t, paths)
+			originalWritten, _ := readSystemTestFile(t, path)
+			external := originalWritten
+			mode := os.FileMode(0640)
+			switch change {
+			case "contents":
+				external = []byte("# external full-name resolver\nnameserver 198.51.100.54\nport 5353\n")
+				writeSystemTestFile(t, path, external, mode)
+			case "permissions":
+				mode = 0600
+				if err := os.Chmod(path, mode); err != nil {
+					t.Fatal(err)
+				}
+			case "removed":
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := state.Configure([]string{domain}, 53053, []string{domain}); err == nil {
+				t.Fatal("refresh overwrote an externally changed owned resolver")
+			}
+			if change == "removed" {
+				if _, err := os.Lstat(path); !os.IsNotExist(err) {
+					t.Fatalf("refresh recreated externally removed resolver: %v", err)
+				}
+			} else {
+				data, actualMode := readSystemTestFile(t, path)
+				if !bytes.Equal(data, external) || actualMode != mode {
+					t.Fatalf("refresh overwrote external change: mode=%o data=%q", actualMode, data)
+				}
+			}
+			after := readSystemTestJournal(t, paths)
+			if !reflect.DeepEqual(after.Resolvers[domain], journal.Resolvers[domain]) {
+				t.Fatalf("refresh replaced original recovery evidence: before=%+v after=%+v", journal.Resolvers[domain], after.Resolvers[domain])
+			}
+			if _, err := os.Stat(filepath.Join(paths.state, "journal.json")); err != nil {
+				t.Fatalf("conflicted refresh lost journal: %v", err)
+			}
+		})
+	}
+}
+
+func TestSystemConfigurePrunesAndReacquiresFullResolvers(t *testing.T) {
+	const first = "api.dev.svc.cluster.local"
+	const second = "db.prod.svc.cluster.local"
+	hosts := []byte("127.1.27.1 " + first + "\n127.1.28.1 " + second + "\n")
+	paths := newSystemTestPaths(t, hosts)
+	firstPath := filepath.Join(paths.resolvers, first)
+	secondPath := filepath.Join(paths.resolvers, second)
+	before := []byte("# original full resolver\nnameserver 192.0.2.53\nport 53\n")
+	writeSystemTestFile(t, firstPath, before, 0640)
+	state := paths.open(t, false)
+	if err := state.Configure([]string{first, second}, 53053, []string{first, second}); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Configure([]string{second}, 53053, []string{second}); err != nil {
+		t.Fatal(err)
+	}
+	data, mode := readSystemTestFile(t, firstPath)
+	if !bytes.Equal(data, before) || mode != 0640 {
+		t.Fatalf("pruned resolver did not recover its original file: mode=%o data=%q", mode, data)
+	}
+	if _, owned := readSystemTestJournal(t, paths).Resolvers[first]; owned {
+		t.Fatal("restored domain still belongs to the journal")
+	}
+	if data, _ := readSystemTestFile(t, secondPath); !bytes.Contains(data, []byte("port 53053\n")) {
+		t.Fatalf("retained resolver lost local port: %s", data)
+	}
+	if err := state.Configure(nil, 53053, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(secondPath); !os.IsNotExist(err) {
+		t.Fatalf("pruned session-created full resolver remains: %v", err)
+	}
+	if len(readSystemTestJournal(t, paths).Resolvers) != 0 {
+		t.Fatal("empty desired resolver set retained authority")
+	}
+	// Reacquisition snapshots the file's new owner image after the first lease
+	// ended, so a later release cannot replay an obsolete initial backup.
+	replacement := []byte("# subsequent resolver owner\nnameserver 198.51.100.53\nport 5353\n")
+	writeSystemTestFile(t, firstPath, replacement, 0600)
+	if err := state.Configure([]string{first}, 53053, []string{first}); err != nil {
+		t.Fatal(err)
+	}
+	if saved := readSystemTestJournal(t, paths).Resolvers[first].Before; !saved.Exists || !bytes.Equal(saved.Data, replacement) || saved.Mode != 0600 {
+		t.Fatalf("reacquisition reused stale original snapshot: %+v", saved)
+	}
+	if err := state.Configure(nil, 53053, nil); err != nil {
+		t.Fatal(err)
+	}
+	data, mode = readSystemTestFile(t, firstPath)
+	if !bytes.Equal(data, replacement) || mode != 0600 {
+		t.Fatalf("reacquired resolver failed to restore new baseline: mode=%o data=%q", mode, data)
+	}
+	if err := state.Restore(); err != nil {
+		t.Fatal(err)
+	}
+	restored, _ := readSystemTestFile(t, paths.hosts)
+	if !bytes.Equal(restored, hosts) {
+		t.Fatalf("hosts did not recover after resolver leases ended: %q", restored)
+	}
+}
+
+func TestSystemConfigurePrunePreservesExternalFullResolver(t *testing.T) {
+	const removed = "api.dev.svc.cluster.local"
+	const retained = "redis.dev.svc.cluster.local"
+	paths := newSystemTestPaths(t, []byte("127.1.27.1 "+removed+"\n127.1.27.2 "+retained+"\n"))
+	state := paths.open(t, false)
+	if err := state.Configure([]string{removed, retained}, 53053, []string{removed, retained}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(paths.resolvers, removed)
+	external := []byte("# external replacement during session\nnameserver 192.0.2.54\nport 5353\n")
+	writeSystemTestFile(t, path, external, 0600)
+	if err := state.Configure([]string{retained}, 53053, []string{retained}); err == nil {
+		t.Fatal("pruned externally changed resolver without reporting conflict")
+	}
+	data, mode := readSystemTestFile(t, path)
+	if !bytes.Equal(data, external) || mode != 0600 {
+		t.Fatalf("prune replaced external resolver: mode=%o data=%q", mode, data)
+	}
+	journal := readSystemTestJournal(t, paths)
+	if _, ok := journal.Resolvers[removed]; !ok {
+		t.Fatal("conflicted prune discarded unresolved recovery evidence")
+	}
+	if data, _ := readSystemTestFile(t, filepath.Join(paths.resolvers, retained)); !bytes.Contains(data, []byte("port 53053\n")) {
+		t.Fatalf("prune altered retained domain: %s", data)
+	}
+}
